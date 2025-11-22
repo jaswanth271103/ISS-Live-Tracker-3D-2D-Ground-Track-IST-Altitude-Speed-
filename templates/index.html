@@ -1,0 +1,333 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ISS Live — 3D / 2D Tracker (Past + Future + IST)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Leaflet (2D map) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+
+  <!-- three.js + Globe.gl (3D globe) -->
+  <script src="https://unpkg.com/three@0.150.0/build/three.min.js"></script>
+  <script src="https://unpkg.com/globe.gl"></script>
+
+  <style>
+    html,body { height:100%; margin:0; background:#04050a; color:#ddd; font-family:system-ui,Arial; }
+    .app { position:relative; width:100%; height:100vh; overflow:hidden; }
+
+    .view-toggle {
+      position:absolute; z-index:40; left:12px; top:12px; display:flex; gap:6px;
+      background:rgba(0,0,0,.55); padding:6px; border-radius:10px; backdrop-filter: blur(2px);
+    }
+    .view-toggle button {
+      border:none; border-radius:8px; padding:8px 12px; font-weight:700;
+      color:#ddd; background:#1c1f2a; cursor:pointer;
+    }
+    .view-toggle button.active { background:#2f6fed; color:#fff; }
+
+    .info {
+      position:absolute; right:12px; top:12px; z-index:40;
+      background:rgba(0,0,0,.35); padding:8px 12px; border-radius:8px; font-size:13px; line-height:1.25rem;
+      min-width: 260px;
+    }
+    .info strong { color:#fff; }
+
+    #globeView, #mapView { position:absolute; inset:0; }
+    #map { width:100%; height:100%; }
+
+    .leaflet-pane, .leaflet-top, .leaflet-bottom { z-index: 10; }
+
+    .iss-pin {
+      width: 18px; height: 18px; border-radius: 50%;
+      background: radial-gradient(circle at 50% 50%, rgba(255,220,220,1) 0%, rgba(255,120,120,.9) 40%, rgba(255,90,90,.0) 100%);
+      box-shadow: 0 0 10px rgba(255,100,100,.7);
+      position: relative;
+    }
+    .iss-pin::after, .iss-pin::before {
+      content:""; position:absolute; left:50%; top:50%;
+      width:0; height:0; border-radius:50%; transform:translate(-50%,-50%);
+      border:2px solid rgba(255,120,120,.7);
+      animation:ripple 1.8s linear infinite;
+    }
+    .iss-pin::before { animation-delay:.6s; }
+    @keyframes ripple {
+      0%   { width:0; height:0; opacity:.9; }
+      100% { width:54px; height:54px; opacity:0; }
+    }
+
+    .legend {
+      position:absolute; left:12px; bottom:12px; z-index:40;
+      background:rgba(0,0,0,.5); padding:6px 8px; border-radius:8px; font-size:12px;
+    }
+    .swatch { display:inline-block; width:14px; height:3px; vertical-align:middle; margin-right:6px; }
+  </style>
+</head>
+<body>
+<div class="app">
+  <div class="view-toggle">
+    <button id="btn3D" class="active">3D view</button>
+    <button id="btn2D">2D view</button>
+  </div>
+
+  <div class="info" id="info">
+    Waiting for data…
+  </div>
+
+  <div class="legend">
+    <div><span class="swatch" style="background:#ffc850"></span>Past ground track</div>
+    <div><span class="swatch" style="background:#23d5ff"></span>Future ground track</div>
+  </div>
+
+  <div id="globeView"></div>
+  <div id="mapView" style="display:none;"><div id="map"></div></div>
+</div>
+
+<script>
+/* ======================= Config ======================= */
+const POLL_INTERVAL_MS  = 3000;   // latest
+const HISTORY_FETCH_MS  = 6000;   // past
+const FUTURE_FETCH_MS   = 30000;  // future (30s)
+const FUTURE_MINUTES    = 45;     // minutes ahead
+const FUTURE_STEP_SEC   = 60;     // seconds per sample
+const ANIM_DURATION_MS  = 2500;
+const DESIRED_MARKER_PIXEL_SIZE = 18;
+const IST_TZ = 'Asia/Kolkata';
+
+/* ======================= Elements ===================== */
+const infoEl  = document.getElementById('info');
+const globeEl = document.getElementById('globeView');
+const mapView = document.getElementById('mapView');
+const btn3D   = document.getElementById('btn3D');
+const btn2D   = document.getElementById('btn2D');
+
+/* ======================= Helpers ====================== */
+function fmtIST(utcIso) {
+  try {
+    const d = new Date(utcIso);
+    return new Intl.DateTimeFormat('en-IN', {
+      timeZone: IST_TZ,
+      hour12: true,
+      year: 'numeric', month: 'short', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    }).format(d);
+  } catch { return utcIso || ''; }
+}
+function lerp(a,b,t){ return a + (b-a)*t; }
+
+/* ======================= 3D Globe ===================== */
+window.world = Globe()(globeEl)
+  .globeImageUrl('//unpkg.com/three-globe/example/img/earth-dark.jpg')
+  .bumpImageUrl('//unpkg.com/three-globe/example/img/earth-topology.png')
+  .showAtmosphere(true)
+  .backgroundColor('#02030a')
+  .pointOfView({ lat: 10, lng: 0, altitude: 2 });
+
+const marker3D = [{ id: 'iss', lat: 0, lng: 0 }];
+let current3D=null, target3D=null, animStart3D=0;
+
+function createSpriteTexture(size=512){
+  const c=document.createElement('canvas'); c.width=c.height=size;
+  const ctx=c.getContext('2d'); const cx=size/2, cy=size/2;
+  const g=ctx.createRadialGradient(cx,cy,0,cx,cy,size/2);
+  g.addColorStop(0,'rgba(255,220,220,1)');
+  g.addColorStop(0.18,'rgba(255,120,120,0.95)');
+  g.addColorStop(0.45,'rgba(255,90,90,0.55)');
+  g.addColorStop(1,'rgba(255,90,90,0)');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(cx,cy,size/2,0,Math.PI*2); ctx.fill();
+  return new THREE.CanvasTexture(c);
+}
+const spriteTex = createSpriteTexture(512);
+
+window.world.objectsData(marker3D)
+  .objectLat(d=>d.lat).objectLng(d=>d.lng)
+  .objectThreeObject(()=>{
+    const g=new THREE.Group();
+    const spr=new THREE.Sprite(new THREE.SpriteMaterial({ map:spriteTex, transparent:true, depthWrite:false }));
+    spr.userData.fixed=true; spr.scale.set(1,1,1);
+    g.add(spr);
+    const sphere=new THREE.Mesh(new THREE.SphereGeometry(0.02,12,12), new THREE.MeshBasicMaterial({ color:0xff3333 }));
+    g.add(sphere);
+    return g;
+  });
+
+const pastTrail = [];        // from /history
+let futureTrail = [];        // from /future
+
+function updatePastArcs3D(){
+  if (pastTrail.length < 2){ window.world.arcsData([]); return; }
+  const arcs=[];
+  for (let i=1;i<pastTrail.length;i++){
+    const s=pastTrail[i-1], e=pastTrail[i];
+    if (s.latitude==null || e.latitude==null) continue;
+    arcs.push({
+      startLat:s.latitude, startLng:s.longitude,
+      endLat:e.latitude,   endLng:e.longitude,
+      kind:'past'
+    });
+  }
+  // merge with future arcs for one render call
+  const fArcs=[];
+  for (let i=1;i<futureTrail.length;i++){
+    const s=futureTrail[i-1], e=futureTrail[i];
+    fArcs.push({
+      startLat:s.latitude, startLng:s.longitude,
+      endLat:e.latitude,   endLng:e.longitude,
+      kind:'future'
+    });
+  }
+  const all = arcs.concat(fArcs);
+  window.world.arcsData(all)
+    .arcColor(d => d.kind==='future' ? 'rgba(35,213,255,0.95)' : 'rgba(255,200,80,0.95)')
+    .arcAltitude(0.001)
+    .arcStroke(d => d.kind==='future' ? 0.35 : 0.35)
+    .arcDashLength(d => d.kind==='future' ? 0.25 : 0)   // dashed future, solid past
+    .arcDashGap(0.6)
+    .arcDashAnimateTime(3000);
+}
+
+function animate3D(){
+  const now=performance.now();
+  if (!current3D && target3D){
+    current3D={lat:target3D.lat,lng:target3D.lng};
+  } else if (current3D && target3D){
+    const t=Math.min(1,(now-animStart3D)/ANIM_DURATION_MS);
+    const lat=lerp(current3D.lat,target3D.lat,t);
+    const lng=lerp(current3D.lng,target3D.lng,t);
+    marker3D[0].lat=lat; marker3D[0].lng=lng; window.world.objectsData(marker3D);
+    if (t>=1){ current3D={lat:target3D.lat,lng:target3D.lng}; target3D=null; }
+  }
+  // keep sprite constant pixel size
+  try{
+    const cam=world.camera(), rend=world.renderer(), fov=cam.fov*Math.PI/180;
+    const h=rend.domElement.clientHeight||window.innerHeight;
+    world.scene().traverse(o=>{
+      if (o.type==='Sprite' && o.userData.fixed){
+        const wp=new THREE.Vector3(); o.getWorldPosition(wp);
+        const d=cam.position.distanceTo(wp)||1;
+        const worldPerPx=2*d*Math.tan(fov/2)/h;
+        const s=DESIRED_MARKER_PIXEL_SIZE*worldPerPx;
+        o.scale.set(s,s,1);
+      }
+    });
+  }catch(e){}
+  requestAnimationFrame(animate3D);
+}
+requestAnimationFrame(animate3D);
+
+/* ======================= 2D Leaflet =================== */
+let map=null, issMarker2D=null, pastLine2D=null, futureLine2D=null;
+const issIcon = L.divIcon({ className:'iss-pin', iconSize:[18,18], iconAnchor:[9,9] });
+
+function initMapIfNeeded(centerLat=10, centerLng=0){
+  if (map) return;
+  map = L.map('map', { worldCopyJump:true, zoomControl:true });
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 8, attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+  issMarker2D = L.marker([centerLat, centerLng], { icon: issIcon, zIndexOffset: 1000 }).addTo(map);
+  pastLine2D   = L.polyline([], { color:'#ffc850', weight:2, opacity:0.95 }).addTo(map);
+  futureLine2D = L.polyline([], { color:'#23d5ff', weight:2, opacity:0.9, dashArray:'6,8' }).addTo(map);
+  map.setView([centerLat, centerLng], 3);
+}
+function refreshMapSize(){ if (map) requestAnimationFrame(()=>map.invalidateSize(true)); }
+
+/* ======================= Data polling ================ */
+async function fetchLatest(){
+  try{
+    const r=await fetch('/latest?t='+Date.now(), { cache:'no-cache' });
+    if (!r.ok){ infoEl.textContent='Server: '+r.status; return; }
+    const j=await r.json();
+    if (j.latitude==null || j.longitude==null){ infoEl.textContent='No coords'; return; }
+
+    const lat=+j.latitude, lng=+j.longitude;
+    const alt=j.altitude_km!=null ? Number(j.altitude_km) : null;
+    const vel_kmh=j.velocity_kmh!=null ? Number(j.velocity_kmh) : null;
+    const vel_kms=j.velocity_km_s!=null ? Number(j.velocity_km_s) : (vel_kmh? vel_kmh/3600 : null);
+
+    infoEl.innerHTML =
+      `<div><strong>IST:</strong> ${fmtIST(j.timestamp_utc)}</div>`+
+      `<div><strong>Lat/Lon:</strong> ${lat.toFixed(4)}°, ${lng.toFixed(4)}°</div>`+
+      `<div><strong>Altitude:</strong> ${alt!=null? alt.toFixed(1)+' km':'—'}</div>`+
+      `<div><strong>Speed:</strong> ${vel_kmh!=null? vel_kmh.toFixed(0)+' km/h':'—'}`
+      + (vel_kms!=null? ` (${vel_kms.toFixed(2)} km/s)` : ``) + `</div>`;
+
+    // 3D animate
+    if (!current3D){
+      current3D={lat,lng};
+      marker3D[0].lat=lat; marker3D[0].lng=lng; window.world.objectsData(marker3D);
+    } else {
+      const changed=Math.abs(current3D.lat-lat)>1e-6 || Math.abs(current3D.lng-lng)>1e-6;
+      if (changed){ target3D={lat,lng}; animStart3D=performance.now(); }
+    }
+    // 2D update
+    if (map) issMarker2D.setLatLng([lat,lng]);
+
+  }catch(e){
+    console.error('fetchLatest error', e);
+    infoEl.textContent='Fetch error';
+  }
+}
+
+async function fetchHistory(){
+  try{
+    const r=await fetch('/history?t='+Date.now(), { cache:'no-cache' });
+    if (!r.ok) return;
+    const arr=await r.json();
+
+    pastTrail.length=0;
+    const pts2D=[];
+    for (const p of arr){
+      if (p.latitude==null || p.longitude==null) continue;
+      pastTrail.push(p);
+      pts2D.push([p.latitude, p.longitude]);
+    }
+    updatePastArcs3D();
+    if (map && pastLine2D) pastLine2D.setLatLngs(pts2D);
+  }catch(e){ console.warn('history fetch error', e); }
+}
+
+async function fetchFuture(){
+  try{
+    const r=await fetch(`/future?n=${FUTURE_MINUTES}&step=${FUTURE_STEP_SEC}&t=${Date.now()}`, { cache:'no-cache' });
+    if (!r.ok) return;
+    const arr=await r.json();
+    futureTrail = Array.isArray(arr) ? arr : [];
+    updatePastArcs3D();
+    if (map && futureLine2D) {
+      futureLine2D.setLatLngs(futureTrail.map(p=>[p.latitude, p.longitude]));
+    }
+  }catch(e){ console.warn('future fetch error', e); }
+}
+
+/* ======================= View toggle ================= */
+function show3D(){
+  globeEl.style.display='block'; mapView.style.display='none';
+  btn3D.classList.add('active'); btn2D.classList.remove('active');
+}
+function show2D(){
+  globeEl.style.display='none';  mapView.style.display='block';
+  btn2D.classList.add('active'); btn3D.classList.remove('active');
+  const lat=current3D?current3D.lat:10, lng=current3D?current3D.lng:0;
+  initMapIfNeeded(lat,lng);
+  // draw current trails on first open
+  if (pastLine2D) pastLine2D.setLatLngs(pastTrail.map(p=>[p.latitude, p.longitude]));
+  if (futureLine2D) futureLine2D.setLatLngs(futureTrail.map(p=>[p.latitude, p.longitude]));
+  refreshMapSize();
+}
+btn3D.addEventListener('click', show3D);
+btn2D.addEventListener('click', show2D);
+
+/* ======================= Start loops ================= */
+fetchLatest(); fetchHistory(); fetchFuture();
+setInterval(fetchLatest,  POLL_INTERVAL_MS);
+setInterval(fetchHistory, HISTORY_FETCH_MS);
+setInterval(fetchFuture,  FUTURE_FETCH_MS);
+setInterval(updatePastArcs3D, 1500);
+
+console.log('ISS tracker (past+future+IST) running');
+</script>
+</body>
+</html>
+
